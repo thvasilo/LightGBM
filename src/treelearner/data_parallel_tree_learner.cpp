@@ -6,6 +6,11 @@
 #include <tuple>
 #include <vector>
 
+#ifdef USE_MPI
+#include <mpi.h>
+#include "mxx/collective.hpp"
+#endif
+
 #include "parallel_tree_learner.h"
 
 namespace LightGBM {
@@ -28,6 +33,8 @@ void DataParallelTreeLearner<TREELEARNER_T>::Init(const Dataset* train_data, boo
   num_machines_ = Network::num_machines();
   // allocate buffer for communication
   size_t buffer_size = this->train_data_->NumTotalBin() * sizeof(HistogramBinEntry);
+
+  Log::Info("%d: Buffer size at init: %d", rank_, buffer_size);
 
   input_buffer_.resize(buffer_size);
   output_buffer_.resize(buffer_size);
@@ -98,7 +105,7 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
     for (auto fid : feature_distribution[i]) {
       buffer_write_start_pos_[fid] = bin_size;
       auto num_bin = this->train_data_->FeatureNumBin(fid);
-      if (this->train_data_->FeatureBinMapper(fid)->GetDefaultBin() == 0) {
+      if (this->train_data_->FeatureBinMapper(fid)->GetDefaultBin() == 0) { // tvas: Investigate how this fucks things up
         num_bin -= 1;
       }
       bin_size += num_bin * sizeof(HistogramBinEntry);
@@ -149,15 +156,124 @@ template <typename TREELEARNER_T>
 void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
   TREELEARNER_T::ConstructHistograms(this->is_feature_used_, true);
   // construct local histograms
-  #pragma omp parallel for schedule(static)
+//  #pragma omp parallel for schedule(static)
+  size_t total_histograms = 0;
+  size_t zero_gradients = 0;
+  size_t zero_hess = 0;
+
+  int count = 2;
+  MPI_Aint displacements[3] = {offsetof(HistogramBinEntry, sum_gradients), offsetof(HistogramBinEntry, sum_hessians),
+                               offsetof(HistogramBinEntry, cnt)};
+  const int block_lengths[2] = {2, 1};
+  MPI_Datatype array_of_types[2] = {MPI_DOUBLE, MPI_INT};
+
+  MPI_Datatype histogram_type;
+//  MPI_Datatype tmp_type;
+//  MPI_Aint lb, extent;
+
+  MPI_Type_create_struct( count, block_lengths, displacements,
+                          array_of_types, &histogram_type);
+//  MPI_Type_get_extent(tmp_type, &lb, &extent); // tvas: Necessary?
+//  MPI_Type_create_resized( tmp_type, lb, extent, &histogram_type);
+  MPI_Type_commit(&histogram_type);
+
+  int unused_features = 0;
   for (int feature_index = 0; feature_index < this->num_features_; ++feature_index) {
-    if ((!this->is_feature_used_.empty() && this->is_feature_used_[feature_index] == false)) continue;
+    if ((!this->is_feature_used_.empty() && this->is_feature_used_[feature_index] == false)) {
+      unused_features++;
+      continue;
+    }
+
+    // tvas: Count the zero gradients and hessians
+    FeatureHistogram& hist_for_feature = this->smaller_leaf_histogram_array_[feature_index];
+    HistogramBinEntry const*  bin_entry_ptr = hist_for_feature.RawData();
+    for (size_t i = 0; i < hist_for_feature.SizeOfHistgram() / sizeof(HistogramBinEntry); ++i) {
+      total_histograms++;
+      if (bin_entry_ptr->sum_gradients == 0.0) {
+        zero_gradients++;
+      }
+      if (bin_entry_ptr->sum_hessians == 0.0) {
+        zero_hess++;
+      }
+      // Advance pointer to next histogram
+      bin_entry_ptr++;
+    }
     // copy to buffer
     std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
                 this->smaller_leaf_histogram_array_[feature_index].RawData(),
                 this->smaller_leaf_histogram_array_[feature_index].SizeOfHistgram());
   }
+
+  Log::Info("[%d] unused_features: %d", rank_, unused_features);
+  Log::Info("[%d] reduce_scatter_size: %d", rank_, reduce_scatter_size_);
+  Log::Info("[%d] reduce_scatter_size/HistogramSize: %d", rank_, reduce_scatter_size_ / sizeof(HistogramBinEntry));
+  Log::Info("[%d] input_buffer char size: %d", rank_, input_buffer_.size());
+  Log::Info("[%d] input_buffer size / Histogram size: %d", rank_, input_buffer_.size() / sizeof(HistogramBinEntry));
+
+  Log::Info("[%d] Zero gradients: %d/%d", Network::rank(), zero_gradients, total_histograms);
+  Log::Info("[%d] Zero hessians: %d/%d", Network::rank(), zero_hess, total_histograms);
+
+  std::vector<HistogramBinEntry> gathered_data;
+  if (rank_ == 0) {
+    gathered_data.resize(total_histograms * num_machines_);
+  }
+
+  mxx::gather(input_buffer_.data(), static_cast<int>(reduce_scatter_size_),
+      reinterpret_cast<char *>((gathered_data.data())), 0);
+
+//  MPI_Gather(input_buffer_.data(), total_histograms, histogram_type,
+//             gathered_data.data(), total_histograms, histogram_type, 0, MPI_COMM_WORLD);
+
+  size_t total_zero_gradients = 0;
+  size_t total_zero_hess = 0;
+
+  if (rank_ == 0) {
+    int limit = 119;
+    std::cout << "Original data: ";
+    auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
+    for (int i = 0; i < limit; ++i) {
+      std::cout << (input_ptr + i)->sum_gradients << ", ";
+    }
+    std::cout << std::endl;
+
+    std::cout << "Gathered data: ";
+    for (int i = 0; i < limit; ++i) {
+      std::cout << gathered_data[i].sum_gradients << ", ";
+    }
+    std::cout << std::endl;
+
+    int different_values = 0;
+    for (size_t i = 0; i < total_histograms * num_machines_; ++i) {
+      if (gathered_data[i].sum_gradients != (input_ptr + i)->sum_gradients) {
+        if (i < total_histograms) { // Only care about the "local" gradients as sent (?) by the root process
+          different_values++;
+          Log::Warning("Found difference between gathered, %f, and input, %f, grad at %zu",
+                       gathered_data[i].sum_gradients, (input_ptr + i)->sum_gradients, i);
+        }
+      }
+      if (gathered_data[i].sum_gradients == 0.0) {
+        total_zero_gradients++;
+      }
+      if (gathered_data[i].sum_hessians == 0.0) {
+        total_zero_hess++;
+      }
+    }
+    std::cout << std::endl;
+    Log::Warning("Number of different values between gathered and input: %d", different_values);
+    Log::Info("[%d] Total zero gradients: %d/%d", Network::rank(), total_zero_gradients, gathered_data.size());
+    Log::Info("[%d] Total zero hessians: %d/%d", Network::rank(), total_zero_hess, gathered_data.size());
+  }
+
   // Reduce scatter for histogram
+  // TODO: Here is where the hist communication happens. They use raw byte arrays and then do casts to
+  //  HistogramBinEntry inside the reduce function. The byte array gets piecemeal populated in the parallel
+  //  loop above (where is it inited/allocated though?), in parallel, over features (do different workers have
+  //  same number of features?. The idea here is to not populate when a histogram is empty
+  //  and have gather-gatherv-local reduce step. At first we can skip (grad==0, hess==0) hists, and
+  //  do a raw float aggregation as a second iteration.
+  Log::Info("[%d] input_buffer elements: %d", rank_, input_buffer_.size() / sizeof(HistogramBinEntry));
+  Log::Info("[%d] output_buffer elements: %d", rank_, output_buffer_.size() / sizeof(HistogramBinEntry));
+  Log::Info("\n");
   Network::ReduceScatter(input_buffer_.data(), reduce_scatter_size_, sizeof(HistogramBinEntry), block_start_.data(),
                          block_len_.data(), output_buffer_.data(), static_cast<comm_size_t>(output_buffer_.size()), &HistogramBinEntry::SumReducer);
   this->FindBestSplitsFromHistograms(this->is_feature_used_, true);
@@ -174,7 +290,7 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplitsFromHistograms(const 
     larger_node_used_features = this->GetUsedFeatures(false);
   }
   OMP_INIT_EX();
-  #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
   for (int feature_index = 0; feature_index < this->num_features_; ++feature_index) {
     OMP_LOOP_EX_BEGIN();
     if (!is_feature_aggregated_[feature_index]) continue;

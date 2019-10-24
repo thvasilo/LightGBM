@@ -192,6 +192,10 @@ inline void SyncUpGlobalBestSplit(char* input_buffer_, char* output_buffer_, Spl
   int size = SplitInfo::Size(max_cat_threshold);
   smaller_best_split->CopyTo(input_buffer_);
   larger_best_split->CopyTo(input_buffer_ + size);
+  // TODO: This is the point where the locally best split candidates are communicated
+  //   to find the best global split. If I change the way Histograms are communicated, it
+  //   might be necessary to change the way these splits are calculated as well, here and in
+  //   DataParallelTreeLearner::FindBestSplitsFromHistograms that calls this function.
   Network::Allreduce(input_buffer_, size * 2, size, output_buffer_,
                      [] (const char* src, char* dst, int size, comm_size_t len) {
     comm_size_t used_size = 0;
