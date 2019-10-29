@@ -121,7 +121,7 @@ class SerialTreeLearner: public TreeLearner {
   /*! \brief number of data */
   data_size_t num_data_;
   /*! \brief number of features */
-  int num_features_;
+  size_t num_features_; // tvas: Should be size_t
   /*! \brief training data */
   const Dataset* train_data_;
   /*! \brief gradients of current iteration */

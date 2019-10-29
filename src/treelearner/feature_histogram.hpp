@@ -423,7 +423,7 @@ class FeatureHistogram {
   * \brief Binary size of this histogram
   */
   int SizeOfHistgram() const {
-    return (meta_->num_bin - meta_->bias) * sizeof(HistogramBinEntry);
+    return (meta_->num_bin - meta_->bias) * sizeof(HistogramBinEntry); // tvas: Investigate this, how to ensure equivalency with hist vectors, does it mess up things?
   }
 
   /*!

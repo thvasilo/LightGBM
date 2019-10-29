@@ -6,10 +6,14 @@
 #include <tuple>
 #include <vector>
 
+#ifdef __JETBRAINS_IDE__
+#define USE_MPI
+#endif
+
 #ifdef USE_MPI
 #include <mpi.h>
-#include "mxx/collective.hpp"
 #endif
+#include "mxx/collective.hpp"
 
 #include "parallel_tree_learner.h"
 
@@ -61,14 +65,22 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
   // generate feature partition for current tree
   std::vector<std::vector<int>> feature_distribution(num_machines_, std::vector<int>());
   std::vector<int> num_bins_distributed(num_machines_, 0);
+  int default_bins = 0;
   for (int i = 0; i < this->train_data_->num_total_features(); ++i) {
     int inner_feature_index = this->train_data_->InnerFeatureIndex(i);
     if (inner_feature_index == -1) { continue; }
     if (this->is_feature_used_[inner_feature_index]) {
+      // tvas: This tries to distribute the number of bins to each machine evenly
+      //  by finding which machine has the least num of bins up till now, and using that
+      //  to assign the bins for the next feature in the loop
       int cur_min_machine = static_cast<int>(ArrayArgs<int>::ArgMin(num_bins_distributed));
+      // tvas: feature_distribution assigns different features to each worker. I think these determine how each worker
+      //  is later assigned per-feature splits to find the best one globally?
       feature_distribution[cur_min_machine].push_back(inner_feature_index);
       auto num_bin = this->train_data_->FeatureNumBin(inner_feature_index);
+      // tvas: What does it mean when the following condition is true?
       if (this->train_data_->FeatureBinMapper(inner_feature_index)->GetDefaultBin() == 0) {
+        default_bins++;
         num_bin -= 1;
       }
       num_bins_distributed[cur_min_machine] += num_bin;
@@ -77,8 +89,42 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
   }
   // get local used feature
   for (auto fid : feature_distribution[rank_]) {
+    // tvas: This determines if a particular feature is aggregated at this machine,
+    //   according to values of `feature_distribution` for the current rank.
+    //   Features that are _not_ aggregated locally, do not take part in this worker's best split computation
     is_feature_aggregated_[fid] = true;
   }
+
+
+
+  std::cout << rank_ << ": default_bins: " << default_bins << std::endl;
+
+  // tvas: There is a discrepancy between the "total bins" and the values provided here.
+  //  My guess is the default bins somehow affect this.
+  std::cout << rank_ << ": num_bins_distributed: ";
+  for (auto value : num_bins_distributed) {
+    std::cout << value << ", ";
+  }
+  std::cout << std::endl;
+  std::cout << rank_ << ": unused_features: ";
+  for (int i = 0; i < this->num_features_; ++i) {
+    if (!this->is_feature_used_[i]) {
+      std::cout << i << ", ";
+    }
+  }
+  std::cout << std::endl;
+
+  std::cout << rank_ << ": feature_distribution: " << std::endl;
+  int machine = 0;
+  for (auto const& vector : feature_distribution) {
+    std::cout << "\tm: " <<machine << " feature_distribution: ";
+    for (auto value : vector) {
+      std::cout << value << ", ";
+    }
+    std::cout << std::endl;
+    machine++;
+  }
+  std::cout << std::endl;
 
   // get block start and block len for reduce scatter
   reduce_scatter_size_ = 0;
@@ -99,14 +145,36 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
     block_start_[i] = block_start_[i - 1] + block_len_[i - 1];
   }
 
+  std::cout << rank_ << ": block_start_: ";
+  for (auto value : block_start_) {
+    std::cout << value << ", ";
+  }
+  std::cout << std::endl;
+
+
+  std::cout << rank_ << ": block_len_: ";
+  for (auto value : block_len_) {
+    std::cout << value << ", ";
+  }
+  std::cout << std::endl;
+
+
   // get buffer_write_start_pos_
   int bin_size = 0;
   for (int i = 0; i < num_machines_; ++i) {
     for (auto fid : feature_distribution[i]) {
+      // tvas: The buffer write pos is determined by the order of the features
+      //  across the workers. Each fid has a corresponding number of bins that it requires
+      //  and the positions where we write its output is **non-contiguous**.
+      //  So simply iterating over the different features and assigning values according to index
+      //  will be wrong. We need to take this into consideration.
       buffer_write_start_pos_[fid] = bin_size;
       auto num_bin = this->train_data_->FeatureNumBin(fid);
       if (this->train_data_->FeatureBinMapper(fid)->GetDefaultBin() == 0) { // tvas: Investigate how this fucks things up
         num_bin -= 1;
+      }
+      if (rank_ == 0) {
+        std::cout << "fid: " << fid << ", num_bin: " << num_bin <<std::endl;
       }
       bin_size += num_bin * sizeof(HistogramBinEntry);
     }
@@ -150,58 +218,96 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
   this->smaller_leaf_splits_->Init(std::get<1>(data), std::get<2>(data));
   // init global data count in leaf
   global_data_count_in_leaf_[0] = std::get<0>(data);
+
+  std::cout << rank_ << " buffer_write_start_pos_: ";
+  for (auto value: buffer_write_start_pos_) {
+    std::cout << value << ", ";
+  }
+  std::cout << std::endl;
+
+  std::cout << rank_ << " buffer_read_start_pos_: ";
+  for (auto value : buffer_read_start_pos_) {
+    std::cout << value << ", ";
+  }
+  std::cout << std::endl;
+
 }
 
 template <typename TREELEARNER_T>
 void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
-  TREELEARNER_T::ConstructHistograms(this->is_feature_used_, true);
+  TREELEARNER_T::ConstructHistograms(this->is_feature_used_, true); // TODO: Non-zero hists can probably be annotated here
   // construct local histograms
-//  #pragma omp parallel for schedule(static)
-  size_t total_histograms = 0;
-  size_t zero_gradients = 0;
-  size_t zero_hess = 0;
-
-  int count = 2;
-  MPI_Aint displacements[3] = {offsetof(HistogramBinEntry, sum_gradients), offsetof(HistogramBinEntry, sum_hessians),
-                               offsetof(HistogramBinEntry, cnt)};
-  const int block_lengths[2] = {2, 1};
-  MPI_Datatype array_of_types[2] = {MPI_DOUBLE, MPI_INT};
-
-  MPI_Datatype histogram_type;
-//  MPI_Datatype tmp_type;
-//  MPI_Aint lb, extent;
-
-  MPI_Type_create_struct( count, block_lengths, displacements,
-                          array_of_types, &histogram_type);
-//  MPI_Type_get_extent(tmp_type, &lb, &extent); // tvas: Necessary?
-//  MPI_Type_create_resized( tmp_type, lb, extent, &histogram_type);
-  MPI_Type_commit(&histogram_type);
-
+  size_t total_bins = 0;
   int unused_features = 0;
-  for (int feature_index = 0; feature_index < this->num_features_; ++feature_index) {
+  size_t total_non_zero_bins = 0;
+  // Mapping from feature id to non-zero bin indices
+  std::unordered_map<int, std::vector<int>> feature_to_nonzero_bins(this->num_features_);
+  // Vector containing non-zero bin objects
+  std::vector<HistogramBinEntry> non_zero_bins_vector;
+  non_zero_bins_vector.reserve(reduce_scatter_size_ / sizeof(HistogramBinEntry)); // Overestimation
+
+  std::vector<std::array<size_t , 2>> non_zero_bins_for_feature;
+  non_zero_bins_for_feature.reserve(reduce_scatter_size_ / sizeof(HistogramBinEntry)); // Underestimation
+//  #pragma omp parallel for schedule(static) // TODO: Add back once bugs are figured out
+  for (size_t feature_index = 0; feature_index < this->num_features_; ++feature_index) {
     if ((!this->is_feature_used_.empty() && this->is_feature_used_[feature_index] == false)) {
       unused_features++;
       continue;
     }
-
-    // tvas: Count the zero gradients and hessians
     FeatureHistogram& hist_for_feature = this->smaller_leaf_histogram_array_[feature_index];
-    HistogramBinEntry const*  bin_entry_ptr = hist_for_feature.RawData();
-    for (size_t i = 0; i < hist_for_feature.SizeOfHistgram() / sizeof(HistogramBinEntry); ++i) {
-      total_histograms++;
-      if (bin_entry_ptr->sum_gradients == 0.0) {
-        zero_gradients++;
+    const HistogramBinEntry *  bin_entry_ptr = hist_for_feature.RawData();
+    int non_zero_bins = 0;
+    for (size_t bin_index = 0; bin_index < hist_for_feature.SizeOfHistgram() / sizeof(HistogramBinEntry); ++bin_index) {
+      total_bins++;
+      if (bin_entry_ptr->sum_gradients != 0.0 || bin_entry_ptr->sum_hessians != 0.0) {
+        // Keep track of indices of non-zero bins
+        non_zero_bins_for_feature.emplace_back(std::array<size_t , 2>{feature_index, bin_index});
+        // copy to buffer
+        non_zero_bins_vector.emplace_back(*bin_entry_ptr);
+        if (rank_ == 0) {
+          std::cout << "Original hist grad entry: " << bin_entry_ptr->sum_gradients << std::endl;
+          std::cout << "Copied hist grad entry: " << non_zero_bins_vector[total_non_zero_bins].sum_gradients << std::endl;
+        }
+        CHECK(non_zero_bins_vector[total_non_zero_bins].sum_gradients == bin_entry_ptr->sum_gradients);
+        non_zero_bins++;
+        total_non_zero_bins++;
+        if (rank_ == 0) {
+          std::cout << "Non-zero data up to now, size:  " << non_zero_bins_vector.size() << " :";
+          for (int i = 0; i < total_non_zero_bins; ++i) {
+            const auto &element = non_zero_bins_vector[i];
+            std::cout //<< "address: " << static_cast<void*>(non_zero_bins_vector.data() + i)
+              << i << " : (grad: "<< element.sum_gradients << ", hess: " << element.sum_hessians << ", cnt: "
+              << element.cnt << "), ";
+          }
+          std::cout << std::endl;
+        }
       }
-      if (bin_entry_ptr->sum_hessians == 0.0) {
-        zero_hess++;
-      }
-      // Advance pointer to next histogram
+      // Advance pointer to next bin
       bin_entry_ptr++;
     }
+    non_zero_bins_vector.resize(total_non_zero_bins);
     // copy to buffer
     std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
-                this->smaller_leaf_histogram_array_[feature_index].RawData(),
-                this->smaller_leaf_histogram_array_[feature_index].SizeOfHistgram());
+                hist_for_feature.RawData(),
+                hist_for_feature.SizeOfHistgram());
+  }
+
+  std::cout << rank_ << ": Number of non-zero bins: " << total_non_zero_bins << "/" << total_bins << std::endl;
+
+  if (rank_ == 0) {
+    int limit = reduce_scatter_size_ / sizeof(HistogramBinEntry);
+    std::cout << "Original data: ";
+    auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
+    for (int i = 0; i < limit; ++i) {
+      std::cout << (input_ptr + i)->sum_gradients << ", ";
+    }
+    std::cout << std::endl;
+
+    std::cout << "Non-zero data: ";
+    for (const auto &element : non_zero_bins_vector) {
+      std::cout << element.sum_gradients << ", ";
+    }
+    std::cout << std::endl;
   }
 
   Log::Info("[%d] unused_features: %d", rank_, unused_features);
@@ -210,42 +316,55 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
   Log::Info("[%d] input_buffer char size: %d", rank_, input_buffer_.size());
   Log::Info("[%d] input_buffer size / Histogram size: %d", rank_, input_buffer_.size() / sizeof(HistogramBinEntry));
 
-  Log::Info("[%d] Zero gradients: %d/%d", Network::rank(), zero_gradients, total_histograms);
-  Log::Info("[%d] Zero hessians: %d/%d", Network::rank(), zero_hess, total_histograms);
+  // Gather number of non-zero bins from each process
+  std::vector<size_t> non_zero_per_process = mxx::gather(total_non_zero_bins, 0);
 
-  std::vector<HistogramBinEntry> gathered_data;
+  // Gather non-zero bins contents
+  std::vector<HistogramBinEntry> gathered_data = mxx::gatherv(non_zero_bins_vector.data(), total_non_zero_bins, 0);
+  // TODO: Can prolly create a container for HistogramBinEntry that also includes the feature id and bin id to avoid second gather
+  // Gather non-zero bins locations per feature id
+  std::vector<std::array<size_t, 2>>
+      gathered_indices = mxx::gatherv(non_zero_bins_for_feature.data(), total_non_zero_bins, non_zero_per_process, 0);
+
+  // Perform reduction at the root
   if (rank_ == 0) {
-    gathered_data.resize(total_histograms * num_machines_);
+    for (size_t i = 0; i < gathered_indices.size(); ++i) {
+      // index_pair: (feature_id, inner_bin_idx)
+      const std::array<size_t, 2> &index_pair = gathered_indices[i];
+
+      // copy to buffer
+      std::vector<char> input_copy(input_buffer_.size());
+      auto histogram_bin = input_copy.data() + buffer_write_start_pos_[index_pair[0]] + (index_pair[1] * sizeof(HistogramBinEntry));
+
+      LightGBM::HistogramBinEntry::SumReducer(
+          reinterpret_cast<char *>(&gathered_data[i]), histogram_bin, sizeof(HistogramBinEntry), sizeof(HistogramBinEntry));
+    }
   }
 
-  mxx::gather(input_buffer_.data(), static_cast<int>(reduce_scatter_size_),
-      reinterpret_cast<char *>((gathered_data.data())), 0);
 
-//  MPI_Gather(input_buffer_.data(), total_histograms, histogram_type,
-//             gathered_data.data(), total_histograms, histogram_type, 0, MPI_COMM_WORLD);
-
+  // TODO: Verify that the local reduction works as expected, then perform a scatter
   size_t total_zero_gradients = 0;
   size_t total_zero_hess = 0;
 
   if (rank_ == 0) {
     int limit = 119;
-    std::cout << "Original data: ";
+//    std::cout << "Original data: ";
     auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
-    for (int i = 0; i < limit; ++i) {
-      std::cout << (input_ptr + i)->sum_gradients << ", ";
-    }
-    std::cout << std::endl;
+//    for (int i = 0; i < limit; ++i) {
+//      std::cout << (input_ptr + i)->sum_gradients << ", ";
+//    }
+//    std::cout << std::endl;
+//
+//    std::cout << "Gathered data: ";
+//    for (int i = 0; i < limit; ++i) {
+//      std::cout << gathered_data[i].sum_gradients << ", ";
+//    }
+//    std::cout << std::endl;
 
-    std::cout << "Gathered data: ";
-    for (int i = 0; i < limit; ++i) {
-      std::cout << gathered_data[i].sum_gradients << ", ";
-    }
-    std::cout << std::endl;
-
-    int different_values = 0;
-    for (size_t i = 0; i < total_histograms * num_machines_; ++i) {
+    uint different_values = 0;
+    for (size_t i = 0; i < total_bins; ++i) {
       if (gathered_data[i].sum_gradients != (input_ptr + i)->sum_gradients) {
-        if (i < total_histograms) { // Only care about the "local" gradients as sent (?) by the root process
+        if (i < total_bins) { // Only care about the "local" gradients as sent (?) by the root process
           different_values++;
           Log::Warning("Found difference between gathered, %f, and input, %f, grad at %zu",
                        gathered_data[i].sum_gradients, (input_ptr + i)->sum_gradients, i);
@@ -259,9 +378,11 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
       }
     }
     std::cout << std::endl;
-    Log::Warning("Number of different values between gathered and input: %d", different_values);
-    Log::Info("[%d] Total zero gradients: %d/%d", Network::rank(), total_zero_gradients, gathered_data.size());
-    Log::Info("[%d] Total zero hessians: %d/%d", Network::rank(), total_zero_hess, gathered_data.size());
+    if (different_values > 0) {
+      Log::Warning("Number of different values between gathered and input: %d", different_values);
+    }
+//    Log::Info("[%d] Total zero gradients: %d/%d", Network::rank(), total_zero_gradients, gathered_data.size());
+//    Log::Info("[%d] Total zero hessians: %d/%d", Network::rank(), total_zero_hess, gathered_data.size());
   }
 
   // Reduce scatter for histogram
