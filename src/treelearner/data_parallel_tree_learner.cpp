@@ -107,7 +107,7 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
   }
   std::cout << std::endl;
   std::cout << rank_ << ": unused_features: ";
-  for (int i = 0; i < this->num_features_; ++i) {
+  for (size_t i = 0; i < this->num_features_; ++i) {
     if (!this->is_feature_used_[i]) {
       std::cout << i << ", ";
     }
@@ -240,12 +240,14 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
   size_t total_bins = 0;
   int unused_features = 0;
   size_t total_non_zero_bins = 0;
+  // TODO: Use and gather mapping instead of map-reduce style vector we have now
   // Mapping from feature id to non-zero bin indices
-  std::unordered_map<int, std::vector<int>> feature_to_nonzero_bins(this->num_features_);
+//  std::unordered_map<int, std::vector<int>> feature_to_nonzero_bins(this->num_features_);
   // Vector containing non-zero bin objects
   std::vector<HistogramBinEntry> non_zero_bins_vector;
   non_zero_bins_vector.reserve(reduce_scatter_size_ / sizeof(HistogramBinEntry)); // Overestimation
 
+  // Map-reduce style vector of (feature_id, bin_idx) pairs. We use these to perform the reduction at the root process
   std::vector<std::array<size_t , 2>> non_zero_bins_for_feature;
   non_zero_bins_for_feature.reserve(reduce_scatter_size_ / sizeof(HistogramBinEntry)); // Underestimation
 //  #pragma omp parallel for schedule(static) // TODO: Add back once bugs are figured out
@@ -264,23 +266,10 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
         non_zero_bins_for_feature.emplace_back(std::array<size_t , 2>{feature_index, bin_index});
         // copy to buffer
         non_zero_bins_vector.emplace_back(*bin_entry_ptr);
-        if (rank_ == 0) {
-          std::cout << "Original hist grad entry: " << bin_entry_ptr->sum_gradients << std::endl;
-          std::cout << "Copied hist grad entry: " << non_zero_bins_vector[total_non_zero_bins].sum_gradients << std::endl;
-        }
+        // TODO: Remove check eventually
         CHECK(non_zero_bins_vector[total_non_zero_bins].sum_gradients == bin_entry_ptr->sum_gradients);
         non_zero_bins++;
         total_non_zero_bins++;
-        if (rank_ == 0) {
-          std::cout << "Non-zero data up to now, size:  " << non_zero_bins_vector.size() << " :";
-          for (int i = 0; i < total_non_zero_bins; ++i) {
-            const auto &element = non_zero_bins_vector[i];
-            std::cout //<< "address: " << static_cast<void*>(non_zero_bins_vector.data() + i)
-              << i << " : (grad: "<< element.sum_gradients << ", hess: " << element.sum_hessians << ", cnt: "
-              << element.cnt << "), ";
-          }
-          std::cout << std::endl;
-        }
       }
       // Advance pointer to next bin
       bin_entry_ptr++;
@@ -296,94 +285,93 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
 
   if (rank_ == 0) {
     int limit = reduce_scatter_size_ / sizeof(HistogramBinEntry);
-    std::cout << "Original data: ";
+    std::cout << "Original data on rank 0: ";
     auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
     for (int i = 0; i < limit; ++i) {
       std::cout << (input_ptr + i)->sum_gradients << ", ";
     }
     std::cout << std::endl;
 
-    std::cout << "Non-zero data: ";
+    std::cout << "Non-zero data on rank 0: ";
     for (const auto &element : non_zero_bins_vector) {
       std::cout << element.sum_gradients << ", ";
     }
     std::cout << std::endl;
   }
 
-  Log::Info("[%d] unused_features: %d", rank_, unused_features);
-  Log::Info("[%d] reduce_scatter_size: %d", rank_, reduce_scatter_size_);
   Log::Info("[%d] reduce_scatter_size/HistogramSize: %d", rank_, reduce_scatter_size_ / sizeof(HistogramBinEntry));
-  Log::Info("[%d] input_buffer char size: %d", rank_, input_buffer_.size());
-  Log::Info("[%d] input_buffer size / Histogram size: %d", rank_, input_buffer_.size() / sizeof(HistogramBinEntry));
 
-  // Gather number of non-zero bins from each process
-  std::vector<size_t> non_zero_per_process = mxx::gather(total_non_zero_bins, 0);
+  // Gather byte size of non-zero bins from each process
+  std::vector<size_t> non_zero_bytes_per_process = mxx::gather(total_non_zero_bins * sizeof(HistogramBinEntry), 0);
 
+  std::vector<size_t> non_zero_bins_per_process(num_machines_);
+
+  // Convert bin byte sizes to number of bins per process for the root
+  if (rank_  == 0) {
+    int idx = 0;
+    std::generate(non_zero_bins_per_process.begin(), non_zero_bins_per_process.end(),
+                  [non_zero_bytes_per_process, idx] () mutable {
+      return non_zero_bytes_per_process[idx++] / sizeof(HistogramBinEntry);});
+  }
+
+
+  // TODO: Figure out how to do custom datatype for mxx
   // Gather non-zero bins contents
-  std::vector<HistogramBinEntry> gathered_data = mxx::gatherv(non_zero_bins_vector.data(), total_non_zero_bins, 0);
+  std::vector<char> gathered_data = mxx::gatherv(reinterpret_cast<char*>(non_zero_bins_vector.data()),
+      total_non_zero_bins * sizeof(HistogramBinEntry), 0);
   // TODO: Can prolly create a container for HistogramBinEntry that also includes the feature id and bin id to avoid second gather
   // Gather non-zero bins locations per feature id
   std::vector<std::array<size_t, 2>>
-      gathered_indices = mxx::gatherv(non_zero_bins_for_feature.data(), total_non_zero_bins, non_zero_per_process, 0);
+      gathered_indices = mxx::gatherv(non_zero_bins_for_feature.data(), total_non_zero_bins, non_zero_bins_per_process, 0);
+
+  // copy of buffer
+  std::vector<char> reduced_data(input_buffer_.size());
 
   // Perform reduction at the root
   if (rank_ == 0) {
+    std::cout << "Number of gathered indices: " << gathered_indices.size() << std::endl;
+    std::cout << "Num non-zero bins per process: ";
+    for (int i = 0; i < num_machines_; ++i) {
+      std::cout << i << ": " << non_zero_bins_per_process[i] << " ";
+    }
+    std::cout << std::endl;
+    std::cout << "Number of gathered bins: " << gathered_data.size() / sizeof(HistogramBinEntry) << std::endl;
+
+    // Perform map-reduce style reduction, based on provided (feature_id, bin_idx) pairs
+    // This reduction is fine because the reduce operation (addition) is commutative
     for (size_t i = 0; i < gathered_indices.size(); ++i) {
       // index_pair: (feature_id, inner_bin_idx)
       const std::array<size_t, 2> &index_pair = gathered_indices[i];
 
-      // copy to buffer
-      std::vector<char> input_copy(input_buffer_.size());
-      auto histogram_bin = input_copy.data() + buffer_write_start_pos_[index_pair[0]] + (index_pair[1] * sizeof(HistogramBinEntry));
+      // Get the end position we will be writing the data to. The goal is to be equivalent to output_buffer_
+      char* output_bin = reduced_data.data() +
+          buffer_write_start_pos_[index_pair[0]] + (index_pair[1] * sizeof(HistogramBinEntry));
 
+      // Use the built-in function to perform the reduction, reducing a single pair of HistogramBinEntry elements
       LightGBM::HistogramBinEntry::SumReducer(
-          reinterpret_cast<char *>(&gathered_data[i]), histogram_bin, sizeof(HistogramBinEntry), sizeof(HistogramBinEntry));
+          &gathered_data[i * sizeof(HistogramBinEntry)], output_bin, sizeof(HistogramBinEntry), sizeof(HistogramBinEntry));
     }
   }
 
+  int limit = reduce_scatter_size_ / sizeof(HistogramBinEntry);
+  std::cout << "Rank: " << rank_ << ": Original data: ";
+  auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
+  for (int i = 0; i < limit; ++i) {
+    std::cout << (input_ptr + i)->sum_gradients << ", ";
+  }
+  std::cout << std::endl;
 
-  // TODO: Verify that the local reduction works as expected, then perform a scatter
-  size_t total_zero_gradients = 0;
-  size_t total_zero_hess = 0;
 
   if (rank_ == 0) {
-    int limit = 119;
-//    std::cout << "Original data: ";
-    auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
-//    for (int i = 0; i < limit; ++i) {
-//      std::cout << (input_ptr + i)->sum_gradients << ", ";
-//    }
-//    std::cout << std::endl;
-//
-//    std::cout << "Gathered data: ";
-//    for (int i = 0; i < limit; ++i) {
-//      std::cout << gathered_data[i].sum_gradients << ", ";
-//    }
-//    std::cout << std::endl;
-
-    uint different_values = 0;
-    for (size_t i = 0; i < total_bins; ++i) {
-      if (gathered_data[i].sum_gradients != (input_ptr + i)->sum_gradients) {
-        if (i < total_bins) { // Only care about the "local" gradients as sent (?) by the root process
-          different_values++;
-          Log::Warning("Found difference between gathered, %f, and input, %f, grad at %zu",
-                       gathered_data[i].sum_gradients, (input_ptr + i)->sum_gradients, i);
-        }
-      }
-      if (gathered_data[i].sum_gradients == 0.0) {
-        total_zero_gradients++;
-      }
-      if (gathered_data[i].sum_hessians == 0.0) {
-        total_zero_hess++;
-      }
+    std::cout << "Gathered and reduced data: ";
+    for (int i = 0; i < limit; ++i) {
+      const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(reduced_data[i * sizeof(HistogramBinEntry)]);
+      std::cout << bin_data.sum_gradients << ", ";
     }
     std::cout << std::endl;
-    if (different_values > 0) {
-      Log::Warning("Number of different values between gathered and input: %d", different_values);
-    }
-//    Log::Info("[%d] Total zero gradients: %d/%d", Network::rank(), total_zero_gradients, gathered_data.size());
-//    Log::Info("[%d] Total zero hessians: %d/%d", Network::rank(), total_zero_hess, gathered_data.size());
   }
+
+  // TODO: Scatter data, s.t. they are equivalent to output_buffer_
 
   // Reduce scatter for histogram
   // TODO: Here is where the hist communication happens. They use raw byte arrays and then do casts to
@@ -412,7 +400,7 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplitsFromHistograms(const 
   }
   OMP_INIT_EX();
 #pragma omp parallel for schedule(static)
-  for (int feature_index = 0; feature_index < this->num_features_; ++feature_index) {
+  for (size_t feature_index = 0; feature_index < this->num_features_; ++feature_index) {
     OMP_LOOP_EX_BEGIN();
     if (!is_feature_aggregated_[feature_index]) continue;
     const int tid = omp_get_thread_num();
