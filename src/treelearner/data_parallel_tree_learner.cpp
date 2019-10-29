@@ -38,7 +38,7 @@ void DataParallelTreeLearner<TREELEARNER_T>::Init(const Dataset* train_data, boo
   // allocate buffer for communication
   size_t buffer_size = this->train_data_->NumTotalBin() * sizeof(HistogramBinEntry);
 
-  Log::Info("%d: Buffer size at init: %d", rank_, buffer_size);
+//  Log::Info("%d: Buffer size at init: %d", rank_, buffer_size);
 
   input_buffer_.resize(buffer_size);
   output_buffer_.resize(buffer_size);
@@ -97,34 +97,34 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
 
 
 
-  std::cout << rank_ << ": default_bins: " << default_bins << std::endl;
+//  std::cout << rank_ << ": default_bins: " << default_bins << std::endl;
 
   // tvas: There is a discrepancy between the "total bins" and the values provided here.
   //  My guess is the default bins somehow affect this.
-  std::cout << rank_ << ": num_bins_distributed: ";
-  for (auto value : num_bins_distributed) {
-    std::cout << value << ", ";
-  }
-  std::cout << std::endl;
-  std::cout << rank_ << ": unused_features: ";
-  for (size_t i = 0; i < this->num_features_; ++i) {
-    if (!this->is_feature_used_[i]) {
-      std::cout << i << ", ";
-    }
-  }
-  std::cout << std::endl;
+//  std::cout << rank_ << ": num_bins_distributed: ";
+//  for (auto value : num_bins_distributed) {
+//    std::cout << value << ", ";
+//  }
+//  std::cout << std::endl;
+//  std::cout << rank_ << ": unused_features: ";
+//  for (size_t i = 0; i < this->num_features_; ++i) {
+//    if (!this->is_feature_used_[i]) {
+//      std::cout << i << ", ";
+//    }
+//  }
+//  std::cout << std::endl;
 
-  std::cout << rank_ << ": feature_distribution: " << std::endl;
-  int machine = 0;
-  for (auto const& vector : feature_distribution) {
-    std::cout << "\tm: " <<machine << " feature_distribution: ";
-    for (auto value : vector) {
-      std::cout << value << ", ";
-    }
-    std::cout << std::endl;
-    machine++;
-  }
-  std::cout << std::endl;
+//  std::cout << rank_ << ": feature_distribution: " << std::endl;
+//  int machine = 0;
+//  for (auto const& vector : feature_distribution) {
+//    std::cout << "\tm: " <<machine << " feature_distribution: ";
+//    for (auto value : vector) {
+//      std::cout << value << ", ";
+//    }
+//    std::cout << std::endl;
+//    machine++;
+//  }
+//  std::cout << std::endl;
 
   // get block start and block len for reduce scatter
   reduce_scatter_size_ = 0;
@@ -145,18 +145,18 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
     block_start_[i] = block_start_[i - 1] + block_len_[i - 1];
   }
 
-  std::cout << rank_ << ": block_start_: ";
-  for (auto value : block_start_) {
-    std::cout << value << ", ";
-  }
-  std::cout << std::endl;
-
-
-  std::cout << rank_ << ": block_len_: ";
-  for (auto value : block_len_) {
-    std::cout << value << ", ";
-  }
-  std::cout << std::endl;
+//  std::cout << rank_ << ": block_start_: ";
+//  for (auto value : block_start_) {
+//    std::cout << value << ", ";
+//  }
+//  std::cout << std::endl;
+//
+//
+//  std::cout << rank_ << ": block_len_: ";
+//  for (auto value : block_len_) {
+//    std::cout << value << ", ";
+//  }
+//  std::cout << std::endl;
 
 
   // get buffer_write_start_pos_
@@ -173,9 +173,9 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
       if (this->train_data_->FeatureBinMapper(fid)->GetDefaultBin() == 0) { // tvas: Investigate how this fucks things up
         num_bin -= 1;
       }
-      if (rank_ == 0) {
-        std::cout << "fid: " << fid << ", num_bin: " << num_bin <<std::endl;
-      }
+//      if (rank_ == 0) {
+//        std::cout << "fid: " << fid << ", num_bin: " << num_bin <<std::endl;
+//      }
       bin_size += num_bin * sizeof(HistogramBinEntry);
     }
   }
@@ -219,17 +219,17 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
   // init global data count in leaf
   global_data_count_in_leaf_[0] = std::get<0>(data);
 
-  std::cout << rank_ << " buffer_write_start_pos_: ";
-  for (auto value: buffer_write_start_pos_) {
-    std::cout << value << ", ";
-  }
-  std::cout << std::endl;
-
-  std::cout << rank_ << " buffer_read_start_pos_: ";
-  for (auto value : buffer_read_start_pos_) {
-    std::cout << value << ", ";
-  }
-  std::cout << std::endl;
+//  std::cout << rank_ << " buffer_write_start_pos_: ";
+//  for (auto value: buffer_write_start_pos_) {
+//    std::cout << value << ", ";
+//  }
+//  std::cout << std::endl;
+//
+//  std::cout << rank_ << " buffer_read_start_pos_: ";
+//  for (auto value : buffer_read_start_pos_) {
+//    std::cout << value << ", ";
+//  }
+//  std::cout << std::endl;
 
 }
 
@@ -274,32 +274,32 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
       // Advance pointer to next bin
       bin_entry_ptr++;
     }
-    non_zero_bins_vector.resize(total_non_zero_bins);
-    // copy to buffer
-    std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
-                hist_for_feature.RawData(),
-                hist_for_feature.SizeOfHistgram());
+//    // copy to buffer
+//    std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
+//                hist_for_feature.RawData(),
+//                hist_for_feature.SizeOfHistgram());
   }
+  non_zero_bins_vector.resize(total_non_zero_bins); // tvas: Unnecessary?
 
-  std::cout << rank_ << ": Number of non-zero bins: " << total_non_zero_bins << "/" << total_bins << std::endl;
+//  std::cout << rank_ << ": Number of non-zero bins: " << total_non_zero_bins << "/" << total_bins << std::endl;
 
-  if (rank_ == 0) {
-    int limit = reduce_scatter_size_ / sizeof(HistogramBinEntry);
-    std::cout << "Original data on rank 0: ";
-    auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
-    for (int i = 0; i < limit; ++i) {
-      std::cout << (input_ptr + i)->sum_gradients << ", ";
-    }
-    std::cout << std::endl;
-
-    std::cout << "Non-zero data on rank 0: ";
-    for (const auto &element : non_zero_bins_vector) {
-      std::cout << element.sum_gradients << ", ";
-    }
-    std::cout << std::endl;
-  }
-
-  Log::Info("[%d] reduce_scatter_size/HistogramSize: %d", rank_, reduce_scatter_size_ / sizeof(HistogramBinEntry));
+//  if (rank_ == 0) {
+//    int limit = reduce_scatter_size_ / sizeof(HistogramBinEntry);
+//    std::cout << "Original data on rank 0: ";
+//    auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
+//    for (int i = 0; i < limit; ++i) {
+//      std::cout << (input_ptr + i)->sum_gradients << ", ";
+//    }
+//    std::cout << std::endl;
+//
+//    std::cout << "Non-zero data on rank 0: ";
+//    for (const auto &element : non_zero_bins_vector) {
+//      std::cout << element.sum_gradients << ", ";
+//    }
+//    std::cout << std::endl;
+//  }
+//
+//  Log::Info("[%d] reduce_scatter_size/HistogramSize: %d", rank_, reduce_scatter_size_ / sizeof(HistogramBinEntry));
 
   // Gather byte size of non-zero bins from each process
   std::vector<size_t> non_zero_bytes_per_process = mxx::gather(total_non_zero_bins * sizeof(HistogramBinEntry), 0);
@@ -313,7 +313,6 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
                   [non_zero_bytes_per_process, idx] () mutable {
       return non_zero_bytes_per_process[idx++] / sizeof(HistogramBinEntry);});
   }
-
 
   // TODO: Figure out how to do custom datatype for mxx
   // Gather non-zero bins contents
@@ -329,13 +328,13 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
 
   // Perform reduction at the root
   if (rank_ == 0) {
-    std::cout << "Number of gathered indices: " << gathered_indices.size() << std::endl;
-    std::cout << "Num non-zero bins per process: ";
-    for (int i = 0; i < num_machines_; ++i) {
-      std::cout << i << ": " << non_zero_bins_per_process[i] << " ";
-    }
-    std::cout << std::endl;
-    std::cout << "Number of gathered bins: " << gathered_data.size() / sizeof(HistogramBinEntry) << std::endl;
+//    std::cout << "Number of gathered indices: " << gathered_indices.size() << std::endl;
+//    std::cout << "Num non-zero bins per process: ";
+//    for (int i = 0; i < num_machines_; ++i) {
+//      std::cout << i << ": " << non_zero_bins_per_process[i] << " ";
+//    }
+//    std::cout << std::endl;
+//    std::cout << "Number of gathered bins: " << gathered_data.size() / sizeof(HistogramBinEntry) << std::endl;
 
     // Perform map-reduce style reduction, based on provided (feature_id, bin_idx) pairs
     // This reduction is fine because the reduce operation (addition) is commutative
@@ -353,23 +352,23 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
     }
   }
 
-  int limit = reduce_scatter_size_ / sizeof(HistogramBinEntry);
-  std::cout << "Rank: " << rank_ << ": Original data: ";
-  auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
-  for (int i = 0; i < limit; ++i) {
-    std::cout << (input_ptr + i)->sum_gradients << ", ";
-  }
-  std::cout << std::endl;
-
-  std::vector<char> output_copy(output_buffer_.size());
-  if (rank_ == 0) {
-    std::cout << "Gathered and reduced data: ";
-    for (int i = 0; i < limit; ++i) {
-      const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(reduced_data[i * sizeof(HistogramBinEntry)]);
-      std::cout << bin_data.sum_gradients << ", ";
-    }
-    std::cout << std::endl;
-  }
+//  int limit = reduce_scatter_size_ / sizeof(HistogramBinEntry);
+//  std::cout << "Rank: " << rank_ << ": Original data: ";
+//  auto input_ptr = reinterpret_cast<const HistogramBinEntry *>(input_buffer_.data());
+//  for (int i = 0; i < limit; ++i) {
+//    std::cout << (input_ptr + i)->sum_gradients << ", ";
+//  }
+//  std::cout << std::endl;
+//
+//  std::vector<char> output_copy(output_buffer_.size());
+//  if (rank_ == 0) {
+//    std::cout << "Gathered and reduced data: ";
+//    for (int i = 0; i < limit; ++i) {
+//      const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(reduced_data[i * sizeof(HistogramBinEntry)]);
+//      std::cout << bin_data.sum_gradients << ", ";
+//    }
+//    std::cout << std::endl;
+//  }
 
   std::vector<size_t> block_len_copy(block_len_.begin(), block_len_.end());
   if (rank_ == 0) {
@@ -379,12 +378,12 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
   }
 
 
-  std::cout << "Rank " << rank_ << " scattered data: ";
-  for (int i = 0; i < limit; ++i) {
-    const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(output_copy[i * sizeof(HistogramBinEntry)]);
-    std::cout << bin_data.sum_gradients << ", ";
-  }
-  std::cout << std::endl;
+//  std::cout << "Rank " << rank_ << " scattered data: ";
+//  for (int i = 0; i < limit; ++i) {
+//    const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(output_copy[i * sizeof(HistogramBinEntry)]);
+//    std::cout << bin_data.sum_gradients << ", ";
+//  }
+//  std::cout << std::endl;
 
 
   this->FindBestSplitsFromHistograms(this->is_feature_used_, true);
