@@ -373,9 +373,9 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
 
   std::vector<size_t> block_len_copy(block_len_.begin(), block_len_.end());
   if (rank_ == 0) {
-    mxx::scatterv(reduced_data.data(), block_len_copy, output_copy.data(), block_len_copy[rank_], 0);
+    mxx::scatterv(reduced_data.data(), block_len_copy, output_buffer_.data(), block_len_copy[rank_], 0);
   } else {
-    mxx::scatterv_recv(output_copy.data(), block_len_copy[rank_], 0);
+    mxx::scatterv_recv(output_buffer_.data(), block_len_copy[rank_], 0);
   }
 
 
@@ -386,25 +386,6 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
   }
   std::cout << std::endl;
 
-  // Reduce scatter for histogram
-  // TODO: Here is where the hist communication happens. They use raw byte arrays and then do casts to
-  //  HistogramBinEntry inside the reduce function. The byte array gets piecemeal populated in the parallel
-  //  loop above (where is it inited/allocated though?), in parallel, over features (do different workers have
-  //  same number of features?. The idea here is to not populate when a histogram is empty
-  //  and have gather-gatherv-local reduce step. At first we can skip (grad==0, hess==0) hists, and
-  //  do a raw float aggregation as a second iteration.
-  Log::Info("[%d] input_buffer elements: %d", rank_, input_buffer_.size() / sizeof(HistogramBinEntry));
-  Log::Info("[%d] output_buffer elements: %d", rank_, output_buffer_.size() / sizeof(HistogramBinEntry));
-  Log::Info("\n");
-  Network::ReduceScatter(input_buffer_.data(), reduce_scatter_size_, sizeof(HistogramBinEntry), block_start_.data(),
-                         block_len_.data(), output_buffer_.data(), static_cast<comm_size_t>(output_buffer_.size()), &HistogramBinEntry::SumReducer);
-
-  std::cout << "Rank " << rank_ << " original output data: ";
-  for (int i = 0; i < limit; ++i) {
-    const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(output_buffer_[i * sizeof(HistogramBinEntry)]);
-    std::cout << bin_data.sum_gradients << ", ";
-  }
-  std::cout << std::endl;
 
   this->FindBestSplitsFromHistograms(this->is_feature_used_, true);
 }
