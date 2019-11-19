@@ -14,6 +14,7 @@
 #include <mpi.h>
 #endif
 #include "mxx/collective.hpp"
+#include "mxx/comm.hpp"
 
 #include "parallel_tree_learner.h"
 
@@ -38,7 +39,8 @@ void DataParallelTreeLearner<TREELEARNER_T>::Init(const Dataset* train_data, boo
   // allocate buffer for communication
   size_t buffer_size = this->train_data_->NumTotalBin() * sizeof(HistogramBinEntry);
 
-//  Log::Info("%d: Buffer size at init: %d", rank_, buffer_size);
+  Log::Info("%d: Buffer size at init: %d", rank_, buffer_size);
+  Log::Info("%d: Number of features: %d", rank_, this->num_features_);
 
   input_buffer_.resize(buffer_size);
   output_buffer_.resize(buffer_size);
@@ -97,7 +99,7 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
 
 
 
-//  std::cout << rank_ << ": default_bins: " << default_bins << std::endl;
+  std::cout << rank_ << ": default_bins: " << default_bins << std::endl;
 
   // tvas: There is a discrepancy between the "total bins" and the values provided here.
   //  My guess is the default bins somehow affect this.
@@ -145,18 +147,18 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
     block_start_[i] = block_start_[i - 1] + block_len_[i - 1];
   }
 
-//  std::cout << rank_ << ": block_start_: ";
-//  for (auto value : block_start_) {
-//    std::cout << value << ", ";
-//  }
-//  std::cout << std::endl;
-//
-//
-//  std::cout << rank_ << ": block_len_: ";
-//  for (auto value : block_len_) {
-//    std::cout << value << ", ";
-//  }
-//  std::cout << std::endl;
+  std::cout << rank_ << ": block_start_: ";
+  for (auto value : block_start_) {
+    std::cout << value << ", ";
+  }
+  std::cout << std::endl;
+
+
+  std::cout << rank_ << ": block_len_: ";
+  for (auto value : block_len_) {
+    std::cout << value << ", ";
+  }
+  std::cout << std::endl;
 
 
   // get buffer_write_start_pos_
@@ -219,12 +221,17 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
   // init global data count in leaf
   global_data_count_in_leaf_[0] = std::get<0>(data);
 
-//  std::cout << rank_ << " buffer_write_start_pos_: ";
-//  for (auto value: buffer_write_start_pos_) {
-//    std::cout << value << ", ";
+//  if (rank_ == 0) {
+    printf("[[%d buffer_write_start_pos_ , length: %zu: ", rank_, buffer_write_start_pos_.size())  ;
+  int elements = 0;
+    for (auto value: buffer_write_start_pos_) {
+      std::cout << value << ", ";
+      elements++;
+      if (elements > 100) { break; }
+    }
+    std::cout << "]]" << std::endl;
 //  }
-//  std::cout << std::endl;
-//
+
 //  std::cout << rank_ << " buffer_read_start_pos_: ";
 //  for (auto value : buffer_read_start_pos_) {
 //    std::cout << value << ", ";
@@ -244,8 +251,9 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
   // Mapping from feature id to non-zero bin indices
 //  std::unordered_map<int, std::vector<int>> feature_to_nonzero_bins(this->num_features_);
   // Vector containing non-zero bin objects
-  std::vector<HistogramBinEntry> non_zero_bins_vector;
+  std::vector<HistogramBinEntry> non_zero_bins_vector; // TODO: Use the input_buffer instead?
   non_zero_bins_vector.reserve(reduce_scatter_size_ / sizeof(HistogramBinEntry)); // Overestimation
+
 
   // Map-reduce style vector of (feature_id, bin_idx) pairs. We use these to perform the reduction at the root process
   std::vector<std::array<size_t , 2>> non_zero_bins_for_feature;
@@ -253,33 +261,90 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
 //  #pragma omp parallel for schedule(static) // TODO: Add back once bugs are figured out
   for (size_t feature_index = 0; feature_index < this->num_features_; ++feature_index) {
     if ((!this->is_feature_used_.empty() && this->is_feature_used_[feature_index] == false)) {
-      unused_features++;
       continue;
     }
+
+    size_t examined_feature = 1400;
+
     FeatureHistogram& hist_for_feature = this->smaller_leaf_histogram_array_[feature_index];
     const HistogramBinEntry *  bin_entry_ptr = hist_for_feature.RawData();
-    int non_zero_bins = 0;
-    for (size_t bin_index = 0; bin_index < hist_for_feature.SizeOfHistgram() / sizeof(HistogramBinEntry); ++bin_index) {
+
+    int num_bins_by_hist_size = hist_for_feature.SizeOfHistgram() / sizeof(HistogramBinEntry);
+    if (this->train_data_->RealFeatureIndex(feature_index) == examined_feature) {
+
+      int num_bins_data = this->train_data_->FeatureNumBin(feature_index);
+
+      if (this->train_data_->FeatureBinMapper(feature_index)->GetDefaultBin() == 0) {
+        printf("%d: Real feature %d uses the default bin.\n", rank_, this->train_data_->RealFeatureIndex(feature_index));
+      }
+
+      printf("%d: For feature_index: %zu, real feature is: %d.\n", rank_, feature_index, this->train_data_->RealFeatureIndex(feature_index));
+      printf("%d: For feature_index: %zu, inner feature is: %d.\n", rank_, feature_index, this->train_data_->InnerFeatureIndex(feature_index));
+      printf("%d: Examined feature number of bins from hist size: %d\n", rank_, num_bins_by_hist_size);
+      printf("%d: Examined feature number of bins from data: %d\n", rank_, num_bins_data);
+      printf("%d: Feature index buffer write position: %d\n", rank_, buffer_write_start_pos_[feature_index]);
+    }
+    for (size_t bin_index = 0; bin_index < num_bins_by_hist_size; ++bin_index) {
       total_bins++;
       if (bin_entry_ptr->sum_gradients != 0.0 || bin_entry_ptr->sum_hessians != 0.0) {
         // Keep track of indices of non-zero bins
-        non_zero_bins_for_feature.emplace_back(std::array<size_t , 2>{feature_index, bin_index});
-        // copy to buffer
+        // TODO: I think one possible solution is to use the "real" feature index here, hence correctly aggregating the hists
+        size_t real_feature_index = this->train_data_->RealFeatureIndex(feature_index);
+        non_zero_bins_for_feature.emplace_back(std::array<size_t , 2>{static_cast<size_t >(buffer_write_start_pos_[feature_index]), bin_index});
+
+        CHECK(real_feature_index < this->train_data_->num_total_features())
+        CHECK(bin_index < hist_for_feature.SizeOfHistgram() / sizeof(HistogramBinEntry))
+        // copy bin to buffer
         non_zero_bins_vector.emplace_back(*bin_entry_ptr);
         // TODO: Remove check eventually
         CHECK(non_zero_bins_vector[total_non_zero_bins].sum_gradients == bin_entry_ptr->sum_gradients);
-        non_zero_bins++;
+        CHECK(non_zero_bins_vector[total_non_zero_bins].sum_hessians == bin_entry_ptr->sum_hessians);
+        CHECK(non_zero_bins_vector[total_non_zero_bins].cnt == bin_entry_ptr->cnt);
         total_non_zero_bins++;
       }
       // Advance pointer to next bin
       bin_entry_ptr++;
     }
-//    // copy to buffer
-//    std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
-//                hist_for_feature.RawData(),
-//                hist_for_feature.SizeOfHistgram());
+    // copy to buffer
+    std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
+                hist_for_feature.RawData(),
+                hist_for_feature.SizeOfHistgram());
   }
-  non_zero_bins_vector.resize(total_non_zero_bins); // tvas: Unnecessary?
+  non_zero_bins_vector.shrink_to_fit();
+  CHECK(non_zero_bins_for_feature.size() == total_non_zero_bins);
+
+  double grad_sum = 0;
+  double hess_sum = 0;
+  size_t cnt_sum = 0;
+
+  double scatt_grad_sum = 0;
+  double scatt_hess_sum = 0;
+  size_t scatt_cnt_sum = 0;
+
+//  printf("%d: total bins measured: %zu, input_buffer_.size() / sizeof(HistogramBinEntry) : %lu\n",
+//         rank_,
+//         total_bins,
+//         input_buffer_.size() / sizeof(HistogramBinEntry));
+//  if (rank_ == 0) {
+//  }
+
+  for (size_t i = 0; i < total_bins; ++i) {
+    const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(input_buffer_[i * sizeof(HistogramBinEntry)]);
+    grad_sum += bin_data.sum_gradients;
+    hess_sum += bin_data.sum_hessians;
+    cnt_sum += bin_data.cnt;
+
+    if (i >= non_zero_bins_vector.size()) {
+      continue;
+    }
+    const HistogramBinEntry &scatt_bin_data = non_zero_bins_vector[i];
+    scatt_grad_sum += scatt_bin_data.sum_gradients;
+    scatt_hess_sum += scatt_bin_data.sum_hessians;
+    scatt_cnt_sum += scatt_bin_data.cnt;
+  }
+//  std::cout << "input_buffer_ Rank " << rank_ << ":  grad_sum: " << grad_sum << ", hess_sum: " << hess_sum << ", cnt_sum: " << cnt_sum << std::endl;
+//  std::cout << "non_zero_bins_vector Rank " << rank_ << ":  grad_sum: " << scatt_grad_sum << ", hess_sum: " << scatt_hess_sum << ", cnt_sum: " << scatt_cnt_sum << std::endl;
+  mxx::comm().barrier();
 
 //  std::cout << rank_ << ": Number of non-zero bins: " << total_non_zero_bins << "/" << total_bins << std::endl;
 
@@ -317,39 +382,62 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
   // TODO: Figure out how to do custom datatype for mxx
   // Gather non-zero bins contents
   std::vector<char> gathered_data = mxx::gatherv(reinterpret_cast<char*>(non_zero_bins_vector.data()),
-      total_non_zero_bins * sizeof(HistogramBinEntry), 0);
+      total_non_zero_bins * sizeof(HistogramBinEntry), non_zero_bytes_per_process, 0);
   // TODO: Can prolly create a container for HistogramBinEntry that also includes the feature id and bin id to avoid second gather
   // Gather non-zero bins locations per feature id
   std::vector<std::array<size_t, 2>>
       gathered_indices = mxx::gatherv(non_zero_bins_for_feature.data(), total_non_zero_bins, non_zero_bins_per_process, 0);
 
-  // copy of buffer
-  std::vector<char> reduced_data(input_buffer_.size());
+  // Ensure the correct count of elements was collected
+  CHECK(gathered_data.size() ==  gathered_indices.size() * sizeof(HistogramBinEntry))
 
-  // Perform reduction at the root
+  // Will hold the reduced data
+  std::vector<char> reduced_data;
+
+  // tvas: Perform local reduction at the root
   if (rank_ == 0) {
-//    std::cout << "Number of gathered indices: " << gathered_indices.size() << std::endl;
-//    std::cout << "Num non-zero bins per process: ";
-//    for (int i = 0; i < num_machines_; ++i) {
-//      std::cout << i << ": " << non_zero_bins_per_process[i] << " ";
-//    }
-//    std::cout << std::endl;
-//    std::cout << "Number of gathered bins: " << gathered_data.size() / sizeof(HistogramBinEntry) << std::endl;
+    reduced_data.resize(output_buffer_.size()); // TODO: See if we can re-use some memory, ensure size is as small as needed
 
     // Perform map-reduce style reduction, based on provided (feature_id, bin_idx) pairs
     // This reduction is fine because the reduce operation (addition) is commutative
     for (size_t i = 0; i < gathered_indices.size(); ++i) {
-      // index_pair: (feature_id, inner_bin_idx)
+      // index_pair: (buffer_write_start_pos, inner_bin_idx)
       const std::array<size_t, 2> &index_pair = gathered_indices[i];
 
-      // Get the end position we will be writing the data to. The goal is to be equivalent to output_buffer_
-      char* output_bin = reduced_data.data() +
-          buffer_write_start_pos_[index_pair[0]] + (index_pair[1] * sizeof(HistogramBinEntry));
+//      if (index_pair[0] == examined_feature) {
+//        printf("Overall bin idx: %zu Index pair: (feature_id: %zu, bin_idx: %zu)\n", i, index_pair[0], index_pair[1]);
+//        auto feature_zero_bin = reinterpret_cast<const HistogramBinEntry*>(&gathered_data[i * sizeof(HistogramBinEntry)]);
+//        printf("Gathered feature %zu bin %zu: (grad: %f, hess: %f, cnt: %d)\n",
+//            examined_feature,
+//            index_pair[1],
+//            feature_zero_bin->sum_gradients, feature_zero_bin->sum_hessians,
+//            feature_zero_bin->cnt);
+//      }
 
+      // Get the start position we will be writing the data to.
+      // TODO: WTF. Could the position that I'm writing stuff to be wrong? What's the end position we want relative
+      //   to the output_buffer_?
+      size_t offset = index_pair[0] + (index_pair[1] * sizeof(HistogramBinEntry));
+//      CHECK(index_pair[1] < )
+      CHECK(offset + sizeof(HistogramBinEntry) < reduced_data.size()) // Check that write will occur within allocated memory
+      char* output_bin = reduced_data.data() + offset;
+
+      CHECK((i + 1) * sizeof(HistogramBinEntry) <= gathered_data.size()) // Check that read will happen within allocated memory
       // Use the built-in function to perform the reduction, reducing a single pair of HistogramBinEntry elements
       LightGBM::HistogramBinEntry::SumReducer(
           &gathered_data[i * sizeof(HistogramBinEntry)], output_bin, sizeof(HistogramBinEntry), sizeof(HistogramBinEntry));
     }
+
+    double grad_sum = 0;
+    double hess_sum = 0;
+    size_t cnt_sum = 0;
+    for (size_t i = 0; i < input_buffer_.size() / sizeof(HistogramBinEntry); ++i) {
+      const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(reduced_data[i * sizeof(HistogramBinEntry)]);
+      grad_sum += bin_data.sum_gradients;
+      hess_sum += bin_data.sum_hessians;
+      cnt_sum += bin_data.cnt;
+    }
+    std::cout << "Reduced grad_sum: " << grad_sum << ", hess_sum: " << hess_sum << ", cnt_sum: " << cnt_sum << std::endl;
   }
 
 //  int limit = reduce_scatter_size_ / sizeof(HistogramBinEntry);
@@ -360,31 +448,158 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
 //  }
 //  std::cout << std::endl;
 //
-//  std::vector<char> output_copy(output_buffer_.size());
 //  if (rank_ == 0) {
-//    std::cout << "Gathered and reduced data: ";
-//    for (int i = 0; i < limit; ++i) {
+//    std::cout << "Gathered and reduced non-zero data: ";
+//    for (int i = 0; i < input_buffer_.size() / sizeof(HistogramBinEntry); ++i) {
 //      const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(reduced_data[i * sizeof(HistogramBinEntry)]);
-//      std::cout << bin_data.sum_gradients << ", ";
+//      if (bin_data.sum_gradients != 0.0) {
+//        std::cout << bin_data.cnt << ", ";
+//      }
 //    }
 //    std::cout << std::endl;
 //  }
 
+  std::vector<char> output_scatter(output_buffer_.size());
   std::vector<size_t> block_len_copy(block_len_.begin(), block_len_.end());
-  if (rank_ == 0) {
-    mxx::scatterv(reduced_data.data(), block_len_copy, output_buffer_.data(), block_len_copy[rank_], 0);
-  } else {
-    mxx::scatterv_recv(output_buffer_.data(), block_len_copy[rank_], 0);
-  }
-
-
-//  std::cout << "Rank " << rank_ << " scattered data: ";
-//  for (int i = 0; i < limit; ++i) {
-//    const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(output_copy[i * sizeof(HistogramBinEntry)]);
-//    std::cout << bin_data.sum_gradients << ", ";
+  mxx::scatterv(reduced_data.data(), block_len_copy, output_scatter.data(), block_len_copy[rank_], 0);
+//  if (rank_ == 0) {
+//  } else {
+//    mxx::scatterv_recv(output_scatter.data(), block_len_copy[rank_], 0);
 //  }
-//  std::cout << std::endl;
 
+//  if (rank_ == 0) {
+//    std::cout << "Rank " << rank_ << " scattered data: ";
+//    for (int i = 0; i < input_buffer_.size() / sizeof(HistogramBinEntry); ++i) {
+//      const HistogramBinEntry &bin_data = reinterpret_cast<HistogramBinEntry&>(output_scatter[i * sizeof(HistogramBinEntry)]);
+//      if (bin_data.sum_gradients != 0.0) {
+//        std::cout << bin_data.cnt << ", ";
+//      }
+//    }
+//    std::cout << std::endl;
+//  }
+
+  // tvas: Perform the scatter-gather step
+  Network::ReduceScatter(input_buffer_.data(), reduce_scatter_size_, sizeof(HistogramBinEntry), block_start_.data(),
+                         block_len_.data(), output_buffer_.data(), static_cast<comm_size_t>(output_buffer_.size()), &HistogramBinEntry::SumReducer);
+
+//  if (is_feature_aggregated_[examined_feature]) {
+//    auto feature_zero_bin = reinterpret_cast<const HistogramBinEntry*>(output_buffer_.data() + buffer_read_start_pos_[0]);
+//    int inner_feature_index = this->train_data_->InnerFeatureIndex(inner_feature_index);
+//    int num_bins_for_feature = this->smaller_leaf_histogram_array_[examined_feature].SizeOfHistgram() / sizeof(HistogramBinEntry);
+//    int num_bins_data = this->train_data_->FeatureNumBin(inner_feature_index);
+//    printf("%d: Examined feature number of bins after scatter/reduce: %d\n", rank_, num_bins_for_feature);
+//    printf("%d: Examined feature number of bins after according to dataset: %d\n", rank_,
+//        num_bins_data);
+//    for (int bin_idx = 0; bin_idx < num_bins_data; ++bin_idx) {
+//      printf("Output feature %zu, inner fid: %d, bin %d: (grad: %f, hess: %f, cnt: %d)\n",
+//          examined_feature, inner_feature_index, bin_idx, feature_zero_bin->sum_gradients, feature_zero_bin->sum_hessians,
+//             feature_zero_bin->cnt);
+//      feature_zero_bin++;
+//    }
+//  }
+
+  size_t different_bins = 0;
+  grad_sum = 0;
+  hess_sum = 0;
+  cnt_sum = 0;
+
+  scatt_grad_sum = 0;
+  scatt_hess_sum = 0;
+  scatt_cnt_sum = 0;
+
+  if (rank_ == 0) {
+    // tvas: Iterate only through the block that the root is responsible for. At least there I expect the output_buffer
+    //   to equal the reduced data no?
+    for (size_t i = 0; i < this->block_len_[rank_] / sizeof(HistogramBinEntry); ++i) {
+      const HistogramBinEntry *bin_data = reinterpret_cast<HistogramBinEntry*>(output_buffer_.data() + i * sizeof(HistogramBinEntry));
+      const HistogramBinEntry *scatt_bin_data = reinterpret_cast<HistogramBinEntry*>(reduced_data.data() + i * sizeof(HistogramBinEntry));
+      grad_sum += bin_data->sum_gradients;
+      hess_sum += bin_data->sum_hessians;
+      cnt_sum += bin_data->cnt;
+
+      scatt_grad_sum += scatt_bin_data->sum_gradients;
+      scatt_hess_sum += scatt_bin_data->sum_hessians;
+      scatt_cnt_sum += scatt_bin_data->cnt;
+
+//      if (i >= buffer_read_start_pos_[0] / sizeof(HistogramBinEntry) &&
+//      i < buffer_read_start_pos_[0] / sizeof(HistogramBinEntry) + this->smaller_leaf_histogram_array_[0].SizeOfHistgram()) {
+//        printf("Feature 0 bins: Bin %zu: grad: (reduced: %f, output: %f), hess: (reduced: %f, output: %f), cnt: (reduced: %d, output: %d)\n",
+//               i,
+//               bin_data->sum_gradients,
+//               bin_data->sum_hessians,
+//               bin_data->cnt);
+//      }
+
+//      if (i < 1000) {
+//        // Print if different and non-z
+//        if ((scatt_bin_data->sum_gradients != bin_data->sum_gradients ||
+//            scatt_bin_data->sum_hessians != bin_data->sum_hessians ||
+//            scatt_bin_data->cnt != bin_data->cnt) &&
+//            (scatt_bin_data->cnt != 0 && bin_data->cnt != 0)) {
+//          printf(">> Bin %zu: grad: (reduced: %f, output: %f), hess: (reduced: %f, output: %f), cnt: (reduced: %d, output: %d)\n",
+//               i,
+//               scatt_bin_data->sum_gradients,
+//               bin_data->sum_gradients,
+//               scatt_bin_data->sum_hessians,
+//               bin_data->sum_hessians,
+//               scatt_bin_data->cnt,
+//               bin_data->cnt);
+//      }
+
+      if (scatt_bin_data->sum_gradients != bin_data->sum_gradients ||
+          scatt_bin_data->sum_hessians != bin_data->sum_hessians ||
+          scatt_bin_data->cnt != bin_data->cnt) {
+        different_bins++;
+//        if (i < 10  || i > (this->block_len_[rank_] / sizeof(HistogramBinEntry) - 10)) {
+//          printf("%d: Bin count for bin %zu differs: reduced: %d, output: %d \n",
+//                 rank_,
+//                 i,
+//                 scatt_bin_data->cnt,
+//                 bin_data->cnt);
+//        }
+      }
+    }
+    std::cout << "Root different bins between reduced and output: " << different_bins << std::endl;
+    std::cout << "Root reduced " << ":  grad_sum: " << scatt_grad_sum << ", hess_sum: " << scatt_hess_sum << ", cnt_sum: " << scatt_cnt_sum << std::endl;
+    std::cout << "Root output buffer " << ":  grad_sum: " << grad_sum << ", hess_sum: " << hess_sum << ", cnt_sum: " << cnt_sum << std::endl;
+  }
+  mxx::comm().barrier();
+
+  grad_sum = 0;
+  hess_sum = 0;
+  cnt_sum = 0;
+
+  scatt_grad_sum = 0;
+  scatt_hess_sum = 0;
+  scatt_cnt_sum = 0;
+
+  different_bins = 0;
+  for (size_t i = 0; i < this->output_buffer_.size() / sizeof(HistogramBinEntry); ++i) {
+    const HistogramBinEntry *bin_data = reinterpret_cast<HistogramBinEntry*>(output_buffer_.data() + i * sizeof(HistogramBinEntry));
+    const HistogramBinEntry *scatt_bin_data = reinterpret_cast<HistogramBinEntry*>(output_scatter.data() + i * sizeof(HistogramBinEntry));
+    grad_sum += bin_data->sum_gradients;
+    hess_sum += bin_data->sum_hessians;
+    cnt_sum += bin_data->cnt;
+
+    scatt_grad_sum += scatt_bin_data->sum_gradients;
+    scatt_hess_sum += scatt_bin_data->sum_hessians;
+    scatt_cnt_sum += scatt_bin_data->cnt;
+
+    if (scatt_bin_data->cnt != bin_data->cnt) {
+      different_bins++;
+//      printf("%d: Bin count for bin %d differs: scatter: %d, output: %d \n", rank_, i, scatt_bin_data->cnt, bin_data->cnt);
+    }
+  }
+  std::cout << "output_buffer_ AFTER SYNC Rank " << rank_ << ":  grad_sum: " << grad_sum << ", hess_sum: " << hess_sum << ", cnt_sum: " << cnt_sum << std::endl;
+  std::cout << "scatter AFTER SYNC Rank " << rank_ << ":  grad_sum: " << scatt_grad_sum << ", hess_sum: " << scatt_hess_sum << ", cnt_sum: " << scatt_cnt_sum << std::endl;
+  std::cout << rank_ << ": different bins: " << different_bins << std::endl;
+  mxx::comm().barrier();
+  if (rank_ == 0) {
+    std::cout << std::endl;
+  }
+  mxx::comm().barrier();
+
+//  output_buffer_.swap(output_scatter); // Can use to test the correctness of output_scatter contents
 
   this->FindBestSplitsFromHistograms(this->is_feature_used_, true);
 }
