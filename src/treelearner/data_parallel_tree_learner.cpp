@@ -215,9 +215,9 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
       bin_entry_ptr++;
     }
     // copy to buffer
-    std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
-                hist_for_feature.RawData(),
-                hist_for_feature.SizeOfHistgram());
+//    std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
+//                hist_for_feature.RawData(),
+//                hist_for_feature.SizeOfHistgram());
   }
   non_zero_bins_vector.shrink_to_fit();
   CHECK(non_zero_bins_for_feature.size() == total_non_zero_bins);
@@ -274,16 +274,16 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
 
 
 
-  std::vector<char> output_scatter(output_buffer_.size());
+//  std::vector<char> output_scatter(output_buffer_.size());
   std::vector<size_t> block_len_copy(block_len_.begin(), block_len_.end());
   // Scatter the reduced histograms back to the workers.
   // TODO: Ideally we would scatter again only the non-zero values to avoid redundant comms
-  mxx::scatterv(reduced_data.data(), block_len_copy, output_scatter.data(), block_len_copy[rank_], 0);
+  mxx::scatterv(reduced_data.data(), block_len_copy, output_buffer_.data(), block_len_copy[rank_], 0);
 
 
   // tvas: Perform the scatter-gather step
-  Network::ReduceScatter(input_buffer_.data(), reduce_scatter_size_, sizeof(HistogramBinEntry), block_start_.data(),
-                         block_len_.data(), output_buffer_.data(), static_cast<comm_size_t>(output_buffer_.size()), &HistogramBinEntry::SumReducer);
+//  Network::ReduceScatter(input_buffer_.data(), reduce_scatter_size_, sizeof(HistogramBinEntry), block_start_.data(),
+//                         block_len_.data(), output_buffer_.data(), static_cast<comm_size_t>(output_buffer_.size()), &HistogramBinEntry::SumReducer);
 
 //  output_buffer_.swap(output_scatter); // Can use to test the correctness of output_scatter contents
 
