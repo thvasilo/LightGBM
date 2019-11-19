@@ -18,6 +18,11 @@
 
 #include "parallel_tree_learner.h"
 
+#ifdef __JETBRAINS_IDE__
+  #define SPARSE_COMMUNICATION
+#endif
+
+
 namespace LightGBM {
 
 template <typename TREELEARNER_T>
@@ -176,11 +181,12 @@ void DataParallelTreeLearner<TREELEARNER_T>::BeforeTrain() {
 
 template <typename TREELEARNER_T>
 void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
-  TREELEARNER_T::ConstructHistograms(this->is_feature_used_, true); // TODO: Non-zero hists can probably be annotated here
+  TREELEARNER_T::ConstructHistograms(this->is_feature_used_, true); // TODO: Non-zero hists can probably be identified here
   // construct local histograms
+#ifdef SPARSE_COMMUNICATION
   size_t total_bins = 0;
   size_t total_non_zero_bins = 0;
-  // TODO: Use and gather mapping instead of map-reduce style vector we have now
+  // TODO: Use and gather mapping instead of map-reduce style vector we have now?
   // Mapping from feature id to non-zero bin indices
   //  std::unordered_map<int, std::vector<int>> feature_to_nonzero_bins(this->num_features_);
   // Vector containing non-zero bin objects
@@ -214,10 +220,6 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
       // Advance pointer to next bin
       bin_entry_ptr++;
     }
-    // copy to buffer
-//    std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
-//                hist_for_feature.RawData(),
-//                hist_for_feature.SizeOfHistgram());
   }
   non_zero_bins_vector.shrink_to_fit();
   CHECK(non_zero_bins_for_feature.size() == total_non_zero_bins);
@@ -272,20 +274,25 @@ void DataParallelTreeLearner<TREELEARNER_T>::FindBestSplits() {
     }
   }
 
-
-
 //  std::vector<char> output_scatter(output_buffer_.size());
   std::vector<size_t> block_len_copy(block_len_.begin(), block_len_.end());
   // Scatter the reduced histograms back to the workers.
   // TODO: Ideally we would scatter again only the non-zero values to avoid redundant comms
   mxx::scatterv(reduced_data.data(), block_len_copy, output_buffer_.data(), block_len_copy[rank_], 0);
-
-
-  // tvas: Perform the scatter-gather step
-//  Network::ReduceScatter(input_buffer_.data(), reduce_scatter_size_, sizeof(HistogramBinEntry), block_start_.data(),
-//                         block_len_.data(), output_buffer_.data(), static_cast<comm_size_t>(output_buffer_.size()), &HistogramBinEntry::SumReducer);
-
-//  output_buffer_.swap(output_scatter); // Can use to test the correctness of output_scatter contents
+#else
+    // construct local histograms
+#pragma omp parallel for schedule(static)
+    for (size_t feature_index = 0; feature_index < this->num_features_; ++feature_index) {
+      if ((!this->is_feature_used_.empty() && this->is_feature_used_[feature_index] == false)) continue;
+      // copy to buffer
+      std::memcpy(input_buffer_.data() + buffer_write_start_pos_[feature_index],
+                  this->smaller_leaf_histogram_array_[feature_index].RawData(),
+                  this->smaller_leaf_histogram_array_[feature_index].SizeOfHistgram());
+    }
+    // Reduce scatter for histogram
+    Network::ReduceScatter(input_buffer_.data(), reduce_scatter_size_, sizeof(HistogramBinEntry), block_start_.data(),
+                           block_len_.data(), output_buffer_.data(), static_cast<comm_size_t>(output_buffer_.size()), &HistogramBinEntry::SumReducer);
+#endif
 
   this->FindBestSplitsFromHistograms(this->is_feature_used_, true);
 }

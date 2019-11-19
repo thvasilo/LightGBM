@@ -6,6 +6,7 @@ endif()
 
 PROJECT(lightgbm)
 
+OPTION(SPARSE_COMMUNICATION "Enable sparse communication for data-parallel learning" ON)
 OPTION(USE_MPI "Enable MPI-based parallel learning" OFF)
 OPTION(USE_OPENMP "Enable OpenMP" ON)
 OPTION(USE_GPU "Enable GPU-accelerated training" OFF)
@@ -243,6 +244,14 @@ if(WIN32 AND (MINGW OR CYGWIN))
     TARGET_LINK_LIBRARIES(_lightgbm Ws2_32)
     TARGET_LINK_LIBRARIES(lightgbm IPHLPAPI)
     TARGET_LINK_LIBRARIES(_lightgbm IPHLPAPI)
+endif()
+
+if(SPARSE_COMMUNICATION)
+    message(STATUS "Compiling with sparse communication")
+    target_compile_definitions(lightgbm PUBLIC SPARSE_COMMUNICATION)
+    ADD_DEFINITIONS(-DSPARSE_COMMUNICATION)
+else ()
+    message(STATUS "Compiling with dense communication")
 endif()
 
 install(TARGETS lightgbm _lightgbm

@@ -76,6 +76,13 @@ class Application {
 
 
 inline void Application::Run() {
+
+#ifdef SPARSE_COMMUNICATION
+  Log::Info("Using sparse communication");
+#else
+  Log::Info("Using dense communication");
+#endif
+
   if (config_.task == TaskType::kPredict || config_.task == TaskType::KRefitTree) {
     InitPredict();
     Predict();
